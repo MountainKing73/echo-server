@@ -1,20 +1,37 @@
-FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+# (1) this stage will be run always on current arch
+# zigbuild & Cargo targets added
+FROM --platform=$BUILDPLATFORM rust:alpine AS chef
 WORKDIR /app
-
+ENV PKGCONFIG_SYSROOTDIR=/
+RUN apk update && apk add --no-cache musl-dev openssl-dev zig
+RUN cargo install --locked cargo-zigbuild cargo-chef
+RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+ 
+# (2) nothing changed
 FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
-
-FROM chef AS builder 
+ 
+# (3) building project deps: need to specify all targets; zigbuild used
+FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
-# Build dependencies - this is the caching Docker layer!
-RUN cargo chef cook --release --recipe-path recipe.json
-# Build application
+RUN cargo chef cook --recipe-path recipe.json --release --zigbuild \
+  --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl
+ 
+# (4) actuall project build for all targets
+# binary renamed to easier copy in runtime stage
 COPY . .
-RUN cargo build --release --bin echo
-
-# We do not need the Rust toolchain to run the binary!
-FROM debian:bookworm-slim AS runtime
+RUN cargo zigbuild -r \
+    --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl && \
+  mkdir /app/linux && \
+  cp target/aarch64-unknown-linux-musl/release/echo /app/linux/arm64 && \
+  cp target/x86_64-unknown-linux-musl/release/echo /app/linux/amd64
+ 
+# (5) this staged will be emulated as was before
+# TARGETPLATFORM usage to copy right binary from builder stage
+# ARG populated by docker itself
+FROM alpine:latest AS runtime
 WORKDIR /app
-COPY --from=builder /app/target/release/echo /usr/local/bin
-ENTRYPOINT ["/usr/local/bin/echo"]
+ARG TARGETPLATFORM
+COPY --from=builder /app/${TARGETPLATFORM} /app/echo
+CMD ["/app/echo"]
